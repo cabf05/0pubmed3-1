@@ -9,6 +9,24 @@ st.set_page_config(page_title="PubMed Relevance Ranker", layout="wide")
 st.title("🔍 PubMed Relevance Ranker")
 st.markdown("Fetch and rank recent PubMed articles based on relevance potential using custom criteria.")
 
+# -------------------- Hugging Face Token --------------------
+st.header("🔑 Hugging Face API Token")
+st.info(
+    "To use Hugging Face features, generate a **Fine-grained Read/Write API token** "
+    "and paste it below. Keep it private."
+)
+
+HF_API_TOKEN = st.text_input(
+    "Hugging Face API Token",
+    type="password",
+    placeholder="Paste your token here",
+    key="hf_token"
+)
+
+if not HF_API_TOKEN:
+    st.warning("Please enter your Hugging Face API token to continue.")
+    st.stop()  # interrompe execução até o token ser inserido
+
 # -------------------- Inputs --------------------
 st.header("Step 1: Customize the Search")
 
@@ -261,54 +279,36 @@ if st.button("🔎 Run PubMed Search"):
 
             # -------------------- Hugging Face Topic Analysis --------------------
             st.header("📝 Hugging Face Topic Analysis (Abstracts)")
+            abstracts = [a for a in df["Abstract"] if a != "N/A" and len(a.strip()) > 20]
+            candidate_labels = hot_keywords + ["diabetes","endocrinology","glucose","insulin","AI","telemedicine"]
 
-            st.info(
-                "To use this feature, generate a Hugging Face API token with **Fine-grained → Read** or **Write** permissions. "
-                "Paste it below. Do NOT share this token publicly."
+            topic_counter = Counter()
+            with st.spinner(f"Processing {len(abstracts)} abstracts via Hugging Face API..."):
+                for i, abstract in enumerate(abstracts, 1):
+                    payload = {
+                        "inputs": abstract,
+                        "parameters": {"candidate_labels": candidate_labels},
+                        "options": {"wait_for_model": True}
+                    }
+                    response = requests.post(
+                        f"https://api-inference.huggingface.co/models/facebook/bart-large-mnli",
+                        headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+                        json=payload,
+                        timeout=30
+                    )
+                    if response.status_code == 200:
+                        result = response.json()
+                        top_label = result['labels'][0]
+                        topic_counter[top_label] += 1
+                    else:
+                        st.warning(f"Abstract {i} failed: {response.status_code}")
+
+            topic_df = (
+                pd.DataFrame.from_dict(topic_counter, orient="index", columns=["Count"])
+                  .rename_axis("Topic")
+                  .sort_values("Count", ascending=False)
             )
-            HF_API_TOKEN = st.text_input(
-                "Hugging Face API Token",
-                type="password",
-                placeholder="Paste your token here",
-                help="Token must have Fine-grained permissions (Read or Write) to call the model API."
-            )
 
-            if HF_API_TOKEN:
-                HF_MODEL = "facebook/bart-large-mnli"
-                headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-
-                abstracts = [a for a in df["Abstract"] if a != "N/A" and len(a.strip()) > 20]
-                candidate_labels = hot_keywords + ["diabetes","endocrinology","glucose","insulin","AI","telemedicine"]
-
-                topic_counter = Counter()
-                with st.spinner(f"Processing {len(abstracts)} abstracts via Hugging Face API..."):
-                    for i, abstract in enumerate(abstracts, 1):
-                        payload = {
-                            "inputs": abstract,
-                            "parameters": {"candidate_labels": candidate_labels},
-                            "options": {"wait_for_model": True}
-                        }
-                        response = requests.post(
-                            f"https://api-inference.huggingface.co/models/{HF_MODEL}",
-                            headers=headers,
-                            json=payload,
-                            timeout=30
-                        )
-                        if response.status_code == 200:
-                            result = response.json()
-                            top_label = result['labels'][0]
-                            topic_counter[top_label] += 1
-                        else:
-                            st.warning(f"Abstract {i} failed: {response.status_code}")
-
-                topic_df = (
-                    pd.DataFrame.from_dict(topic_counter, orient="index", columns=["Count"])
-                      .rename_axis("Topic")
-                      .sort_values("Count", ascending=False)
-                )
-
-                st.subheader("📊 Most Frequent Topics in Abstracts")
-                st.bar_chart(topic_df)
-                st.dataframe(topic_df.reset_index())
-            else:
-                st.warning("Please enter a Hugging Face API token to run topic analysis.")
+            st.subheader("📊 Most Frequent Topics in Abstracts")
+            st.bar_chart(topic_df)
+            st.dataframe(topic_df.reset_index())
