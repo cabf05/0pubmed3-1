@@ -202,4 +202,113 @@ if st.button("🔎 Run PubMed Search"):
             st.dataframe(jc.reset_index().rename(columns={"index":"Journal","Journal":"Count"}))
 
             # 🏅 Renowned Institutions Summary
-            st.subheader("
+            st.subheader("🏅 Renowned Institutions Summary")
+            ren_counter = Counter()
+            for parts in df["AffParts"]:
+                match = [inst for inst in institutions if any(inst in p for p in parts)]
+                if match:
+                    for inst in set(match):
+                        ren_counter[inst] += 1
+                else:
+                    ren_counter["Others"] += 1
+            ren_df = (
+                pd.DataFrame.from_dict(ren_counter, orient="index", columns=["Count"])
+                  .rename_axis("Institution")
+                  .sort_values("Count", ascending=False)
+            )
+            st.bar_chart(ren_df)
+            st.dataframe(ren_df.reset_index())
+
+            # Selected Institutions Summary
+            st.subheader("Selected Institutions Summary")
+            sel_counter = Counter()
+            for parts in df["AffParts"]:
+                match = [inst for inst in summary_institutions if any(inst in p for p in parts)]
+                if match:
+                    for inst in set(match):
+                        sel_counter[inst] += 1
+                else:
+                    sel_counter["Others"] += 1
+            sel_df = (
+                pd.DataFrame.from_dict(sel_counter, orient="index", columns=["Count"])
+                  .rename_axis("Institution")
+                  .sort_values("Count", ascending=False)
+            )
+            st.bar_chart(sel_df)
+            st.dataframe(sel_df.reset_index())
+
+            # 📄 Publication Types
+            st.subheader("📄 Articles per Publication Type")
+            pt = df["Publication Types"].str.split("; ").explode().value_counts()
+            st.bar_chart(pt)
+            st.dataframe(pt.reset_index().rename(columns={"index":"Publication Type",0:"Count"}))
+
+            # 🔥 Hot Keywords in Titles
+            st.subheader("🔥 Articles with Hot Keywords in Title")
+            hk = Counter()
+            for title in df["Title"]:
+                t = normalize_text(title)
+                for kw in hot_keywords:
+                    if kw in t:
+                        hk[kw] += 1
+            hk_df = (
+                pd.DataFrame.from_dict(hk, orient="index", columns=["Count"])
+                  .rename_axis("Hot Keyword")
+                  .sort_values("Count", ascending=False)
+            )
+            st.bar_chart(hk_df)
+            st.dataframe(hk_df.reset_index())
+
+            # -------------------- Hugging Face Topic Analysis --------------------
+            st.header("📝 Hugging Face Topic Analysis (Abstracts)")
+
+            st.info(
+                "To use this feature, generate a Hugging Face API token with **Fine-grained → Read** or **Write** permissions. "
+                "Paste it below. Do NOT share this token publicly."
+            )
+            HF_API_TOKEN = st.text_input(
+                "Hugging Face API Token",
+                type="password",
+                placeholder="Paste your token here",
+                help="Token must have Fine-grained permissions (Read or Write) to call the model API."
+            )
+
+            if HF_API_TOKEN:
+                HF_MODEL = "facebook/bart-large-mnli"
+                headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+
+                abstracts = [a for a in df["Abstract"] if a != "N/A" and len(a.strip()) > 20]
+                candidate_labels = hot_keywords + ["diabetes","endocrinology","glucose","insulin","AI","telemedicine"]
+
+                topic_counter = Counter()
+                with st.spinner(f"Processing {len(abstracts)} abstracts via Hugging Face API..."):
+                    for i, abstract in enumerate(abstracts, 1):
+                        payload = {
+                            "inputs": abstract,
+                            "parameters": {"candidate_labels": candidate_labels},
+                            "options": {"wait_for_model": True}
+                        }
+                        response = requests.post(
+                            f"https://api-inference.huggingface.co/models/{HF_MODEL}",
+                            headers=headers,
+                            json=payload,
+                            timeout=30
+                        )
+                        if response.status_code == 200:
+                            result = response.json()
+                            top_label = result['labels'][0]
+                            topic_counter[top_label] += 1
+                        else:
+                            st.warning(f"Abstract {i} failed: {response.status_code}")
+
+                topic_df = (
+                    pd.DataFrame.from_dict(topic_counter, orient="index", columns=["Count"])
+                      .rename_axis("Topic")
+                      .sort_values("Count", ascending=False)
+                )
+
+                st.subheader("📊 Most Frequent Topics in Abstracts")
+                st.bar_chart(topic_df)
+                st.dataframe(topic_df.reset_index())
+            else:
+                st.warning("Please enter a Hugging Face API token to run topic analysis.")
