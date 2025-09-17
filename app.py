@@ -1,261 +1,205 @@
-# app.py
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
 import pandas as pd
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
-from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+import re
+from collections import Counter
 
-# Tentar importar KeyBERT e SentenceTransformer (opcional)
-try:
-    from keybert import KeyBERT
-    from sentence_transformers import SentenceTransformer
-    KEYBERT_AVAILABLE = True
-except Exception:
-    KEYBERT_AVAILABLE = False
-
-# -------------------- Streamlit Config --------------------
-st.set_page_config(page_title="Medical Hot Topics (KeyBERT)", layout="wide")
-st.title("🔎 Medical Hot Topics Explorer — KeyBERT")
-st.markdown(
-    "Extrai palavras-chave relevantes de artigos PubMed. "
-    "Tenta usar KeyBERT (com sentence-transformers). Se não estiver disponível, faz fallback para análise por n-grams."
-)
-
-# -------------------- Sidebar / Options --------------------
-st.sidebar.header("Opções")
-use_keybert = st.sidebar.checkbox("Usar KeyBERT (se disponível)", value=True)
-embedding_model_name = st.sidebar.text_input("Modelo de embeddings (sentence-transformers)", value="all-MiniLM-L6-v2")
-top_n_keywords = st.sidebar.number_input("Top N keywords (globais)", min_value=5, max_value=50, value=20, step=5)
-per_article_keywords = st.sidebar.number_input("Top n keywords por artigo (apenas para top K artigos)", min_value=0, max_value=10, value=3)
-per_article_topk = st.sidebar.number_input("Aplicar per-article keywords apenas aos top K artigos", min_value=0, max_value=200, value=20)
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "Observação: o `sentence-transformers` baixa um modelo e pode instalar `torch`. "
-    "Em ambientes com build limitado (Streamlit Cloud / Render gratuito) isso pode falhar. "
-    "Se o deploy quebrar, desmarque 'Usar KeyBERT' e use o fallback por n-grams."
-)
+st.set_page_config(page_title="PubMed Relevance Ranker", layout="wide")
+st.title("🔍 PubMed Relevance Ranker")
+st.markdown("Fetch and rank recent PubMed articles based on relevance potential using custom criteria.")
 
 # -------------------- Inputs --------------------
 st.header("Step 1: Customize the Search")
 
-default_query = '("Endocrinology" OR "Diabetes") AND 2024/10/01:2025/09/01[Date - Publication]'
-query = st.text_area("PubMed Search Query", value=default_query, height=120)
+default_query = '("Endocrinology" OR "Diabetes") AND 2024/10/01:2025/06/28[Date - Publication]'
+query = st.text_area("PubMed Search Query", value=default_query, height=100)
 
-max_results = st.number_input("Max number of articles to fetch", min_value=10, max_value=500, value=150, step=10)
+default_journals = "\n".join([
+    "N Engl J Med", "JAMA", "BMJ", "Lancet", "Nature", "Science", "Cell"
+])
+journal_input = st.text_area("High-Impact Journals (one per line)", value=default_journals, height=150)
+journals = [j.strip().lower() for j in journal_input.splitlines() if j.strip()]
 
-# -------------------- Helpers --------------------
-def extract_pub_date(article):
-    # tenta várias tags comuns
-    date = article.findtext(".//PubDate/Year")
-    if date:
-        return date
-    date = article.findtext(".//ArticleDate/Year")
-    if date:
-        return date
-    date = article.findtext(".//PubDate/MedlineDate")
-    if date:
-        return date
-    # fallback: tentar juntar Year/Month/Day se existirem
-    y = article.findtext(".//Journal/JournalIssue/PubDate/Year")
-    m = article.findtext(".//Journal/JournalIssue/PubDate/Month")
-    d = article.findtext(".//Journal/JournalIssue/PubDate/Day")
-    if y:
-        return " ".join([p for p in [y, m, d] if p])
-    return "N/A"
+default_institutions = "\n".join([
+    "Harvard", "Oxford", "Mayo", "NIH", "Stanford",
+    "UCSF", "Yale", "Cambridge", "Karolinska Institute", "Johns Hopkins"
+])
+inst_input = st.text_area("Renowned Institutions (one per line)", value=default_institutions, height=150)
+institutions = [i.strip().lower() for i in inst_input.splitlines() if i.strip()]
 
-def extract_abstract(article):
-    # junta vários AbstractText possíveis
-    texts = []
-    for abs_part in article.findall(".//Abstract/AbstractText"):
-        if abs_part is not None:
-            # AbstractText pode ter atributo Label
-            label = abs_part.attrib.get("Label")
-            part_text = (abs_part.text or "")
-            if label:
-                texts.append(f"{label}: {part_text}")
+default_summary = "\n".join([
+    "Harvard","Stanford","Massachusetts Institute of Technology","University of Cambridge","University of Oxford",
+    "University of California, Berkeley","Princeton University","Yale University","University of Chicago","Columbia",
+    "California Institute of Technology","University College London","ETH Zurich","Imperial College London","University of Toronto",
+    "Tsinghua University","Peking University","National University of Singapore","University of Melbourne","University of Tokyo",
+    "Kyoto University","Seoul National University","University of Hong Kong","University of British Columbia","University of Sydney",
+    "University of Edinburgh","University of Manchester","Ludwig Maximilian University of Munich","University of Copenhagen",
+    "University of Amsterdam","University of Zurich","McGill University","King's College London","University of Illinois Urbana-Champaign",
+    "École Polytechnique Fédérale de Lausanne","University of Pennsylvania","Cornell University","Johns Hopkins","Duke University",
+    "University of California, Los Angeles","University of Michigan","University of Texas at Austin","Washington University in St. Louis",
+    "University of California, San Diego","University of California, Davis","University of Washington","University of Wisconsin–Madison",
+    "New York University","University of North Carolina at Chapel Hill","National Taiwan University"
+])
+summary_input = st.text_area(
+    "Institutions for Summary Analysis (one per line)",
+    value=default_summary,
+    height=200
+)
+summary_institutions = [i.strip().lower() for i in summary_input.splitlines() if i.strip()]
+
+default_keywords = "\n".join([
+    "glp-1", "semaglutide", "tirzepatide", "ai", "machine learning", "telemedicine"
+])
+hot_input = st.text_area("Hot Keywords (one per line)", value=default_keywords, height=100)
+hot_keywords = [k.strip().lower() for k in hot_input.splitlines() if k.strip()]
+
+max_results = st.number_input("Max number of articles to fetch", min_value=10, max_value=1000, value=250, step=10)
+
+# -------------------- Utility Functions --------------------
+def normalize_text(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+INSTITUTION_KEYWORDS = [
+    "univ", "university", "hospital", "clinic", "institute",
+    "college", "center", "centre", "school", "department",
+    "laboratory", "lab"
+]
+
+def split_affiliations(raw_aff, institution_list):
+    parts = (raw_aff or "").split(";")
+    filtered = []
+    for part in parts:
+        text = normalize_text(part)
+        if len(text) < 5 or re.fullmatch(r"\d+", text):
+            continue
+        if any(inst in text for inst in institution_list):
+            filtered.append(text)
+            continue
+        if any(kw in text for kw in INSTITUTION_KEYWORDS):
+            filtered.append(text)
+    return list(dict.fromkeys(filtered))
+
+def match_institution(text, institution_list):
+    text = normalize_text(text)
+    return any(re.search(rf"\b{re.escape(inst)}\b", text) for inst in institution_list)
+
+# -------------------- Search and Processing --------------------
+if st.button("🔎 Run PubMed Search"):
+    with st.spinner("Fetching articles..."):
+        # ESearch
+        r = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={"db":"pubmed","retmax":str(max_results),"retmode":"json","term":query}
+        )
+        id_list = r.json().get("esearchresult", {}).get("idlist", [])
+
+        # EFetch
+        response = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+            params={"db":"pubmed","id":",".join(id_list),"retmode":"xml"},
+            timeout=20
+        )
+
+        parsed_ok = parsed_fail = 0
+        records = []
+
+        def score_article(article, aff_parts, title_text):
+            score, reasons = 0, []
+            journal = article.findtext(".//Journal/Title","").lower()
+            if any(j in journal for j in journals):
+                score+=2; reasons.append("High-impact journal (+2)")
+            pub_types = [pt.text.lower() for pt in article.findall(".//PublicationType")]
+            valued = ["randomized controlled trial","systematic review","meta-analysis","guideline","practice guideline"]
+            if any(pt in valued for pt in pub_types):
+                score+=2; reasons.append("Valued publication type (+2)")
+            if len(article.findall(".//Author"))>=5:
+                score+=1; reasons.append("Multiple authors (+1)")
+            if any(match_institution(aff, institutions) for aff in aff_parts):
+                score+=1; reasons.append("Prestigious institution (+1)")
+            if any(kw in title_text for kw in hot_keywords):
+                score+=2; reasons.append("Hot keyword in title (+2)")
+            if article.find(".//GrantList") is not None:
+                score+=2; reasons.append("Has research funding (+2)")
+            return score, "; ".join(reasons)
+
+        def build_citation(article):
+            authors = article.findall(".//Author")
+            if authors:
+                first = authors[0]
+                last = first.findtext("LastName","")
+                init = first.findtext("Initials","")
+                auth = f"{last} {init}" if last else "Unknown Author"
             else:
-                texts.append(part_text)
-    return " ".join(texts).strip()
+                auth = "Unknown Author"
+            year = article.findtext(".//PubDate/Year") or "n.d."
+            title = article.findtext(".//ArticleTitle","").strip()
+            journal = article.findtext(".//Journal/Title","")
+            return f"{auth} et al. ({year}). {title}. {journal}."
 
-# -------------------- Main: Fetch + Parse --------------------
-if st.button("🔎 Run Analysis"):
-    with st.spinner("Buscando PMIDs no PubMed..."):
         try:
-            # Step 1: ESearch
-            search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-            search_params = {
-                "db": "pubmed",
-                "retmax": str(max_results),
-                "retmode": "json",
-                "term": query
-            }
-            r = requests.get(search_url, params=search_params, timeout=30)
-            r.raise_for_status()
-            id_list = r.json()["esearchresult"].get("idlist", [])
-        except Exception as e:
-            st.error(f"Erro ao consultar PubMed (esearch): {e}")
-            st.stop()
-
-    if not id_list:
-        st.warning("Nenhum PMID retornado para a query informada.")
-        st.stop()
-
-    with st.spinner("Buscando detalhes dos artigos (efetch)..."):
-        try:
-            efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-            params = {
-                "db": "pubmed",
-                "id": ",".join(id_list),
-                "retmode": "xml"
-            }
-            response = requests.get(efetch_url, params=params, timeout=60)
-            response.raise_for_status()
-        except Exception as e:
-            st.error(f"Erro ao baixar dados do PubMed (efetch): {e}")
-            st.stop()
-
-    # Parse XML
-    records = []
-    try:
-        root = ET.fromstring(response.content)
-        articles = root.findall(".//PubmedArticle")
-        for article in articles:
-            pmid = article.findtext(".//PMID") or ""
-            title = article.findtext(".//ArticleTitle") or ""
-            abstract = extract_abstract(article)
-            journal = article.findtext(".//Journal/Title") or ""
-            date = extract_pub_date(article)
-            link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
-            records.append({
-                "PMID": pmid,
-                "Title": title,
-                "Abstract": abstract,
-                "Journal": journal,
-                "Date": date,
-                "Link": link
-            })
-    except Exception as e:
-        st.error(f"Falha ao parsear XML: {e}")
-        st.stop()
-
-    df = pd.DataFrame(records)
-    st.success(f"Buscados {len(df)} artigos. Exibindo resultados.")
-
-    if df.empty:
-        st.warning("Nenhum artigo válido para processar.")
-        st.stop()
-
-    # Mostrar tabela básica
-    st.subheader("Artigos retornados")
-    st.dataframe(df[["PMID", "Title", "Journal", "Date"]], use_container_width=True)
-
-    # Preparar texto para análise
-    # preferimos usar Title + Abstract (quando disponível)
-    df["Text"] = (df["Title"].fillna("") + ". " + df["Abstract"].fillna("")).str.strip()
-    corpus = " ".join(df["Text"].astype(str).tolist())
-    if not corpus:
-        st.warning("Não há texto suficiente para análise de keywords.")
-        st.stop()
-
-    # -------------------- KeyBERT path --------------------
-    did_keybert_run = False
-    if use_keybert and KEYBERT_AVAILABLE:
-        with st.spinner("Carregando modelo de embeddings e KeyBERT (pode demorar na primeira vez)..."):
-            try:
-                # Cache do modelo de embeddings para evitar reloads em interações
-                @st.cache_resource(show_spinner=False)
-                def load_sentence_model(name):
-                    return SentenceTransformer(name)
-
-                sentence_model = load_sentence_model(embedding_model_name)
-                kw_model = KeyBERT(sentence_model)
-                # Extrair keywords globais (corpus)
-                global_keywords = kw_model.extract_keywords(
-                    corpus,
-                    keyphrase_ngram_range=(1, 2),
-                    stop_words="english",
-                    top_n=top_n_keywords,
-                    use_mmr=True,
-                    diversity=0.6
-                )
-                did_keybert_run = True
-            except Exception as e:
-                st.warning(
-                    "Não foi possível carregar KeyBERT / sentence-transformers neste ambiente. "
-                    "Faremos fallback para análise por n-grams. "
-                    f"Erro: {e}"
-                )
-                did_keybert_run = False
-
-    if did_keybert_run:
-        st.header("🔑 KeyBERT — Top keywords (global)")
-        kw_df = pd.DataFrame(global_keywords, columns=["Keyword", "Score"])
-        st.dataframe(kw_df, use_container_width=True)
-
-        # WordCloud a partir das keywords (multiplicando pelo score)
-        term_freq = {k: float(s) for k, s in global_keywords}
-        wc = WordCloud(width=900, height=400, background_color="white").generate_from_frequencies(term_freq)
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.imshow(wc, interpolation="bilinear")
-        ax.axis("off")
-        st.pyplot(fig)
-
-        # Per-article keywords (aplicar apenas nos top K artigos para economizar tempo)
-        if per_article_keywords > 0 and per_article_topk > 0:
-            st.subheader(f"Top {per_article_keywords} keywords por artigo (apenas para os top {per_article_topk} artigos)")
-            # ordena artigos por presença de keywords? aqui usamos comprimento do texto como proxy e pegamos top k
-            top_articles = df.head(per_article_topk).copy()
-            per_article_results = []
-            for idx, row in top_articles.iterrows():
+            root = ET.fromstring(response.content)
+            for art in root.findall(".//PubmedArticle"):
                 try:
-                    text = row["Text"]
-                    if not text.strip():
-                        per_article_results.append((row["PMID"], row["Title"], []))
-                        continue
-                    kws = kw_model.extract_keywords(
-                        text,
-                        keyphrase_ngram_range=(1, 2),
-                        stop_words="english",
-                        top_n=per_article_keywords,
-                        use_mmr=False
-                    )
-                    per_article_results.append((row["PMID"], row["Title"], kws))
-                except Exception as e:
-                    per_article_results.append((row["PMID"], row["Title"], []))
+                    pmid = art.findtext(".//PMID")
+                    title = art.findtext(".//ArticleTitle","") or ""
+                    link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                    journal = art.findtext(".//Journal/Title","")
+                    date = art.findtext(".//PubDate/Year") or art.findtext(".//PubDate/MedlineDate") or "N/A"
 
-            # Mostrar em tabela
-            rows = []
-            for pmid, title, kws in per_article_results:
-                rows.append({
-                    "PMID": pmid,
-                    "Title": title,
-                    "Keywords": ", ".join([k for k, s in kws])
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    raw_affs = [a.text for a in art.findall(".//AffiliationInfo/Affiliation") if a.text]
+                    aff_text = "; ".join(raw_affs)
+                    aff_parts = split_affiliations(aff_text, institutions)
 
-    # -------------------- Fallback: CountVectorizer (n-grams) --------------------
-    if not did_keybert_run:
-        st.header("📊 Análise por n-grams (fallback)")
-        vectorizer = CountVectorizer(stop_words='english', ngram_range=(1, 3), max_features=50)
-        X = vectorizer.fit_transform(df["Text"].astype(str).tolist())
-        freqs = zip(vectorizer.get_feature_names_out(), X.toarray().sum(axis=0))
-        freq_df = pd.DataFrame(freqs, columns=["Keyword", "Frequency"]).sort_values("Frequency", ascending=False)
-        st.dataframe(freq_df, use_container_width=True)
+                    abstract_elems = art.findall(".//Abstract/AbstractText")
+                    abstract = "\n".join(e.text.strip() for e in abstract_elems if e.text) if abstract_elems else "N/A"
 
-        # WordCloud
-        freq_dict = dict(zip(freq_df["Keyword"], freq_df["Frequency"]))
-        if freq_dict:
-            wc = WordCloud(width=900, height=400, background_color="white").generate_from_frequencies(freq_dict)
-            fig, ax = plt.subplots(figsize=(12, 5))
-            ax.imshow(wc, interpolation="bilinear")
-            ax.axis("off")
-            st.pyplot(fig)
+                    pub_types = [pt.text for pt in art.findall(".//PublicationType")]
+                    pub_types_text = "; ".join(pub_types)
+                    citation = build_citation(art)
 
-    # -------------------- Download CSV --------------------
-    st.markdown("---")
-    csv = df.to_csv(index=False)
-    st.download_button("⬇️ Baixar CSV com artigos", data=csv, file_name="pubmed_articles.csv", mime="text/csv")
+                    score, reason = score_article(art, aff_parts, normalize_text(title))
+                    records.append({
+                        "Title": title,
+                        "Link": link,
+                        "Journal": journal,
+                        "Date": date,
+                        "Publication Types": pub_types_text,
+                        "Affiliations": aff_text,
+                        "AffParts": aff_parts,
+                        "Abstract": abstract,
+                        "Citation": citation,
+                        "Score": score,
+                        "Why": reason
+                    })
+                    parsed_ok += 1
+                except:
+                    parsed_fail += 1
+        except:
+            st.error("Failed to parse XML from PubMed.")
 
-    st.success("Análise concluída.")
+        df = pd.DataFrame(records).sort_values("Score", ascending=False)
+        st.success(f"Found {len(id_list)} PMIDs. Parsed {parsed_ok}, failed {parsed_fail}.")
+
+        if not df.empty:
+            st.dataframe(df.drop(columns="AffParts")[[
+                "Title","Journal","Date","Publication Types","Affiliations",
+                "Score","Why","Citation","Abstract"
+            ]], use_container_width=True)
+            st.download_button(
+                "⬇️ Download CSV",
+                data=df.drop(columns="AffParts").to_csv(index=False),
+                file_name="ranked_pubmed_results.csv",
+                mime="text/csv"
+            )
+
+            st.header("📊 Summary Analysis")
+
+            # 🔬 Articles per Journal
+            st.subheader("🔬 Articles per Journal")
+            jc = df['Journal'].value_counts()
+            st.bar_chart(jc)
+            st.dataframe(jc.reset_index().rename(columns={"index":"Journal","Journal":"Count"}))
+
+            # 🏅 Renowned Institutions Summary
+            st.subheader("
